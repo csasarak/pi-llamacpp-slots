@@ -38,6 +38,8 @@ interface SlotState {
 	binFilename: string;
 	/** The llama.cpp server base URL */
 	serverUrl: string;
+	/** Model identifier for router mode (e.g. "org/model.gguf:Q4_K_M"). Omitted in single-model mode. */
+	modelName?: string;
 }
 
 // ── Settings Interface ───────────────────────────────────────
@@ -47,6 +49,8 @@ interface SlotSettings {
 	eraseOnQuit?: boolean;
 	/** Explicit llama.cpp server URL override. When set, bypasses ctx.model.baseUrl derivation. */
 	serverUrl?: string;
+	/** Explicit model name override for router mode. When set, used instead of ctx.model.id. */
+	modelName?: string;
 	/** Save slot on agent_end (once per agent loop) instead of turn_end (per tool call). Default: true. */
 	saveOnAgentEnd?: boolean;
 	/** Save slot on session shutdown (quit). Default: false — per-turn/agent saves are usually sufficient. */
@@ -129,9 +133,10 @@ function saveSettings(settings: SlotSettings): void {
  * Returns the first available slot ID, or the first slot ID if none available.
  * Returns null if the server doesn't support slot management.
  */
-async function discoverSlots(serverUrl: string): Promise<number | null> {
+async function discoverSlots(serverUrl: string, modelName?: string): Promise<number | null> {
 	try {
-		const response = await fetch(`${serverUrl}/slots`, {
+		const modelParam = modelName ? `?model=${encodeURIComponent(modelName)}` : "";
+		const response = await fetch(`${serverUrl}/slots${modelParam}`, {
 			signal: AbortSignal.timeout(3000),
 		});
 		if (!response.ok) return null;
@@ -156,9 +161,10 @@ async function discoverSlots(serverUrl: string): Promise<number | null> {
  * Get full slot info from GET /slots.
  * Returns the slot object (with state, n_prompt_tokens, etc.) or null if unavailable.
  */
-async function getSlotInfo(serverUrl: string, slotId: number): Promise<{ is_processing?: boolean; n_prompt_tokens?: number } | null> {
+async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string): Promise<{ is_processing?: boolean; n_prompt_tokens?: number } | null> {
 	try {
-		const response = await fetch(`${serverUrl}/slots`, {
+		const modelParam = modelName ? `?model=${encodeURIComponent(modelName)}` : "";
+		const response = await fetch(`${serverUrl}/slots${modelParam}`, {
 			signal: AbortSignal.timeout(3000),
 		});
 		if (!response.ok) return null;
@@ -180,8 +186,8 @@ async function getSlotInfo(serverUrl: string, slotId: number): Promise<{ is_proc
  * restarted and lost its in-memory cache. Returns true if cold,
  * false if warm, null if the check fails.
  */
-async function isSlotCold(serverUrl: string, slotId: number): Promise<boolean | null> {
-	const info = await getSlotInfo(serverUrl, slotId);
+async function isSlotCold(serverUrl: string, slotId: number, modelName?: string): Promise<boolean | null> {
+	const info = await getSlotInfo(serverUrl, slotId, modelName);
 	if (info) {
 		return (info.n_prompt_tokens ?? 0) <= 1;
 	}
@@ -201,10 +207,14 @@ function saveSlot(state: SlotState): void {
 	saveController = controller;
 	setTimeout(() => controller.abort(), SAVE_TIMEOUT_MS);
 
-	fetch(`${state.serverUrl}/slots/${state.slotId}?action=save`, {
+	const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
+	const body: Record<string, string> = { filename: state.binFilename };
+	if (state.modelName) body.model = state.modelName;
+
+	fetch(`${state.serverUrl}/slots/${state.slotId}?action=save${modelParam}`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ filename: state.binFilename }),
+		body: JSON.stringify(body),
 		signal: controller.signal,
 	})
 		.then(async (res) => {
@@ -225,12 +235,16 @@ function saveSlot(state: SlotState): void {
  */
 async function restoreSlot(state: SlotState): Promise<boolean> {
 	try {
+		const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
+		const body: Record<string, string> = { filename: state.binFilename };
+		if (state.modelName) body.model = state.modelName;
+
 		const response = await fetch(
-			`${state.serverUrl}/slots/${state.slotId}?action=restore`,
+			`${state.serverUrl}/slots/${state.slotId}?action=restore${modelParam}`,
 			{
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ filename: state.binFilename }),
+				body: JSON.stringify(body),
 			},
 		);
 		if (!response.ok) {
@@ -252,10 +266,16 @@ async function restoreSlot(state: SlotState): Promise<boolean> {
  */
 async function eraseSlot(state: SlotState): Promise<void> {
 	try {
+		const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
+		const body: Record<string, string> = {};
+		if (state.modelName) body.model = state.modelName;
+
 		const response = await fetch(
-			`${state.serverUrl}/slots/${state.slotId}?action=erase`,
+			`${state.serverUrl}/slots/${state.slotId}?action=erase${modelParam}`,
 			{
 				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
 			},
 		);
 		if (!response.ok) {
@@ -409,23 +429,27 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		const settings = loadSettings();
 		log(`[llamacpp-slots] settings.serverUrl=${settings.serverUrl}, ctx.model.baseUrl=${ctx.model?.baseUrl}`);
 		let serverUrl: string | undefined;
+		let modelName: string | undefined;
 
 		// ctx.ui.setStatus("llamacpp-slots", "checking...");
 
 		if (settings.serverUrl) {
 			serverUrl = settings.serverUrl.replace(/\/+$/, "");
-		} else {
-			const model = ctx.model;
-			if (model?.baseUrl) {
-				serverUrl = model.baseUrl.replace(/\/+$/, "");
-			}
+		}
+		if (settings.modelName) {
+			modelName = settings.modelName;
+		} else if (ctx.model?.id) {
+			modelName = ctx.model.id;
+		}
+		if (ctx.model?.baseUrl && !serverUrl) {
+			serverUrl = ctx.model.baseUrl.replace(/\/+$/, "");
 		}
 		if (!serverUrl) {
 			log("[llamacpp-slots] No server URL — staying dormant");
 			// ctx.ui.setStatus("llamacpp-slots", "no server URL");
 			return;
 		}
-		log(`[llamacpp-slots] session_start: serverUrl=${serverUrl}`);
+		log(`[llamacpp-slots] session_start: serverUrl=${serverUrl}, modelName=${modelName ?? "<none>"}`);
 
 		// Step 1: Try to restore persisted slot state from branch
 		const restored = restoreFromBranch(ctx);
@@ -442,8 +466,13 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			log(`[llamacpp-slots] Restored slot state from branch: slot=${restored.slotId}, bin=${restored.binFilename}`);
 			isNewSession = false;
 
+			// Refresh modelName from current model (in case it changed)
+			if (modelName !== undefined) {
+				slotState.modelName = modelName;
+			}
+
 			// Quick probe to verify the server is reachable
-			const reachable = await isSlotCold(serverUrl, restored.slotId);
+			const reachable = await isSlotCold(serverUrl, restored.slotId, restored.modelName);
 			if (reachable !== null) {
 				// ctx.ui.setStatus("llamacpp-slots", `slot ${slotState.slotId} ready`);
 			} else {
@@ -455,7 +484,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		log("[llamacpp-slots] No persisted slot state in branch — discovering fresh");
 
 		// Step 2: No persisted state — discover slots fresh
-		const slotId = await discoverSlots(serverUrl);
+		const slotId = await discoverSlots(serverUrl, modelName);
 		if (slotId == null) {
 			// Server doesn't support slots or is unreachable — stay dormant
 			slotsActive = false;
@@ -479,6 +508,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			sessionFile,
 			binFilename: deriveBinFilename(sessionId),
 			serverUrl,
+			modelName,
 		};
 		slotsActive = true;
 		firstTurn = true;
@@ -502,12 +532,16 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		// Per-turn saves via turn_end/agent_end are usually sufficient.
 		if (settings.saveOnShutdown && _event.reason !== "reload") {
 			try {
+				const modelParam = slotState.modelName ? `&model=${encodeURIComponent(slotState.modelName)}` : "";
+				const body: Record<string, string> = { filename: slotState.binFilename };
+				if (slotState.modelName) body.model = slotState.modelName;
+
 				const response = await fetch(
-					`${slotState.serverUrl}/slots/${slotState.slotId}?action=save`,
+					`${slotState.serverUrl}/slots/${slotState.slotId}?action=save${modelParam}`,
 					{
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
-						body: JSON.stringify({ filename: slotState.binFilename }),
+						body: JSON.stringify(body),
 					},
 				);
 				if (response.ok) {
@@ -536,7 +570,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		if (!slotsActive || !slotState) return;
 		const state = slotState;  // Capture for TS narrowing across awaits
 
-		const slotInfo = await getSlotInfo(state.serverUrl, state.slotId);
+		const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName);
 		const nTokens = slotInfo?.n_prompt_tokens;
 
 		if (slotInfo?.is_processing) {
