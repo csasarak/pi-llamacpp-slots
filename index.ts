@@ -324,10 +324,11 @@ function restoreFromBranch(ctx: ExtensionContext): SlotState | null {
  * Derive a deterministic .bin filename from the session ID.
  * Uses getSessionId() for a clean UUID-based name.
  */
-function deriveBinFilename(sessionId: string): string {
+function deriveBinFilename(sessionId: string, modelName?: string): string {
 	// Strip hyphens from UUID for a cleaner filename
 	const cleanId = sessionId.replace(/-/g, "");
-	return `session_${cleanId}.bin`;
+	const modelSuffix = modelName ? `_${modelName.replace(/[^a-zA-Z0-9]/g, "_")}` : "";
+	return `session_${cleanId}${modelSuffix}.bin`;
 }
 
 // ── Extension Factory ────────────────────────────────────────
@@ -506,7 +507,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		slotState = {
 			slotId,
 			sessionFile,
-			binFilename: deriveBinFilename(sessionId),
+			binFilename: deriveBinFilename(sessionId, modelName),
 			serverUrl,
 			modelName,
 		};
@@ -519,6 +520,45 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		log(`[llamacpp-slots] Allocated slot ${slotState.slotId} for session ${sessionId} (bin=${slotState.binFilename})`);
 		// ctx.ui.notify(`llamacpp-slots: allocated slot ${slotState.slotId}`, "info");
 		// ctx.ui.setStatus("llamacpp-slots", `slot ${slotState.slotId} allocated`);
+	});
+
+	// ── Model Switch: Save old slot, allocate new one for new model ──
+
+	pi.on("model_select", async (event, ctx) => {
+		if (!slotState) return;
+		log(`[llamacpp-slots] model_select: ${event.previousModel.id} -> ${event.model.id}`);
+
+		// Save current slot state before switching
+		log(`[llamacpp-slots] Saving slot ${slotState.slotId} before model switch`);
+		saveSlot(slotState);
+
+		// Derive new model name
+		const settings = loadSettings();
+		const newModelName = settings.modelName ?? event.model.id;
+
+		// Discover a slot for the new model
+		const newSlotId = await discoverSlots(slotState.serverUrl, newModelName);
+		if (newSlotId == null) {
+			log("[llamacpp-slots] Model switch: slot discovery failed — keeping old slot");
+			return;
+		}
+
+		// Update slot state for new model
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (!sessionId) {
+			log("[llamacpp-slots] Model switch: no session ID — keeping old slot");
+			return;
+		}
+
+		slotState.slotId = newSlotId;
+		slotState.modelName = newModelName;
+		slotState.binFilename = deriveBinFilename(sessionId, newModelName);
+		firstTurn = true;
+		// Always try restore on model switch — fails gracefully if .bin doesn't exist
+		isNewSession = false;
+
+		persistSlotState(pi);
+		log(`[llamacpp-slots] Model switch complete: slot=${newSlotId}, bin=${slotState.binFilename}`);
 	});
 
 	// ── Session Shutdown: Final Save + Conditional Erase ──────
@@ -596,9 +636,9 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 				return ok;
 			});
 			await restoringPromise;
-		} else if (nTokens === 0) {
-			// Subsequent turn, explicitly 0 — llama.cpp restarted mid-session.
-			log(`[llamacpp-slots] Slot ${state.slotId} cold (n_prompt_tokens=0) — restoring`);
+		} else if (nTokens === 0 || nTokens === undefined || nTokens === "idle") {
+			// Subsequent turn, slot is cold (0, missing, or idle) — llama.cpp restarted mid-session.
+			log(`[llamacpp-slots] Slot ${state.slotId} cold (n_prompt_tokens=${nTokens}) — restoring`);
 			restoringPromise = restoreSlot(state).then((ok) => {
 				if (ok) {
 					log(`[llamacpp-slots] Restored slot ${state.slotId} from ${state.binFilename}`);
