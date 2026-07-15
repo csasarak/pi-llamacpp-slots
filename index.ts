@@ -579,11 +579,15 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		const settings = loadSettings();
 		const newModelName = settings.modelName ?? event.model.id;
 
+		// Update model name regardless of discovery outcome
+		slotState.modelName = newModelName;
+
 		// Discover a slot for the new model
 		const newSlotId = await discoverSlots(slotState.serverUrl, newModelName);
 		if (newSlotId == null) {
-			log("[llamacpp-slots] Model switch: slot discovery failed — keeping old slot");
+			log("[llamacpp-slots] Model switch: slot discovery failed — keeping old slot ID");
 			ctx.ui.notify("llamacpp-slots: slot discovery failed on model switch", "warning");
+			modelReloadPending = true;
 			return;
 		}
 
