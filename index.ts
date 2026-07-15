@@ -236,31 +236,41 @@ function saveSlot(state: SlotState): void {
 
 /**
  * Restore a slot's KV cache from a .bin file.
- * Awaited — called during session_start.
+ * Awaited — called during turn_start. Retries briefly if model is still loading.
  */
 async function restoreSlot(state: SlotState): Promise<boolean> {
-	try {
-		const { modelParam, body } = buildSlotRequest(state, { filename: state.binFilename });
+	const maxRetries = 3;
+	const retryDelay = 2000; // ms
 
-		const response = await fetch(
-			`${state.serverUrl}/slots/${state.slotId}?action=restore${modelParam}`,
-			{
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(body),
-			},
-		);
-		if (!response.ok) {
-			log(
-				`[llamacpp-slots] Restore failed: HTTP ${response.status} (file may not exist)`,
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		try {
+			const { modelParam, body } = buildSlotRequest(state, { filename: state.binFilename });
+
+			const response = await fetch(
+				`${state.serverUrl}/slots/${state.slotId}?action=restore${modelParam}`,
+				{
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify(body),
+				},
 			);
+			if (response.ok) return true;
+
+			// Retry on 400/500 if modelReloadPending (model likely still loading)
+			if (modelReloadPending && [400, 500].includes(response.status) && attempt < maxRetries) {
+				log(`[llamacpp-slots] Restore failed: HTTP ${response.status}, retrying in ${retryDelay}ms`);
+				await new Promise((r) => setTimeout(r, retryDelay));
+				continue;
+			}
+
+			log(`[llamacpp-slots] Restore failed: HTTP ${response.status} (file may not exist)`);
+			return false;
+		} catch (err) {
+			log(`[llamacpp-slots] Restore error: ${(err as Error).message}`);
 			return false;
 		}
-		return true;
-	} catch (err) {
-		log(`[llamacpp-slots] Restore error: ${(err as Error).message}`);
-		return false;
 	}
+	return false;
 }
 
 /**
