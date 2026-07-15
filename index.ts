@@ -202,14 +202,14 @@ async function isSlotCold(serverUrl: string, slotId: number, modelName?: string)
  * This avoids triggering unnecessary model reloads on subsequent calls.
  */
 function buildSlotRequest(state: SlotState, extraBody?: Record<string, string>): { modelParam: string; body: Record<string, string> } {
-	const includeModel = modelSwitchPending && state.modelName;
-	const modelParam = includeModel && state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
+	// Always include model param in router mode so server routes to correct model
+	const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
 	const body: Record<string, string> = { ...extraBody };
-	if (includeModel && state.modelName) {
+	if (state.modelName) {
 		body.model = state.modelName;
 	}
-	// Clear pending flag after first use
-	if (includeModel) {
+	// Clear pending flag after first use (model load triggered)
+	if (modelSwitchPending) {
 		modelSwitchPending = false;
 	}
 	return { modelParam, body };
