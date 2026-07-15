@@ -65,6 +65,7 @@ let saveController: AbortController | null = null;
 let restoringPromise: Promise<boolean> | null = null;  // In-flight restore promise for race prevention
 let firstTurn = true;  // Track if this is the first turn of the session
 let isNewSession = false;  // True when no persisted slot state was found (brand-new session)
+let modelSwitchPending = false;  // True after model_select — send model param on first slot call to trigger load
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -161,7 +162,7 @@ async function discoverSlots(serverUrl: string, modelName?: string): Promise<num
  * Get full slot info from GET /slots.
  * Returns the slot object (with state, n_prompt_tokens, etc.) or null if unavailable.
  */
-async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string): Promise<{ is_processing?: boolean; n_prompt_tokens?: number } | null> {
+async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string): Promise<{ is_processing?: boolean; n_prompt_tokens?: number | string } | null> {
 	try {
 		const modelParam = modelName ? `?model=${encodeURIComponent(modelName)}` : "";
 		const response = await fetch(`${serverUrl}/slots${modelParam}`, {
@@ -189,9 +190,29 @@ async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string
 async function isSlotCold(serverUrl: string, slotId: number, modelName?: string): Promise<boolean | null> {
 	const info = await getSlotInfo(serverUrl, slotId, modelName);
 	if (info) {
-		return (info.n_prompt_tokens ?? 0) <= 1;
+		const tokens = typeof info.n_prompt_tokens === "number" ? info.n_prompt_tokens : 0;
+		return tokens <= 1;
 	}
 	return null;
+}
+
+/**
+ * Build query param and body for a slot API call.
+ * Only includes `model` param when modelSwitchPending is true (first call after model switch).
+ * This avoids triggering unnecessary model reloads on subsequent calls.
+ */
+function buildSlotRequest(state: SlotState, extraBody?: Record<string, string>): { modelParam: string; body: Record<string, string> } {
+	const includeModel = modelSwitchPending && state.modelName;
+	const modelParam = includeModel && state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
+	const body: Record<string, string> = { ...extraBody };
+	if (includeModel && state.modelName) {
+		body.model = state.modelName;
+	}
+	// Clear pending flag after first use
+	if (includeModel) {
+		modelSwitchPending = false;
+	}
+	return { modelParam, body };
 }
 
 /**
@@ -207,9 +228,7 @@ function saveSlot(state: SlotState): void {
 	saveController = controller;
 	setTimeout(() => controller.abort(), SAVE_TIMEOUT_MS);
 
-	const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
-	const body: Record<string, string> = { filename: state.binFilename };
-	if (state.modelName) body.model = state.modelName;
+	const { modelParam, body } = buildSlotRequest(state, { filename: state.binFilename });
 
 	fetch(`${state.serverUrl}/slots/${state.slotId}?action=save${modelParam}`, {
 		method: "POST",
@@ -235,9 +254,7 @@ function saveSlot(state: SlotState): void {
  */
 async function restoreSlot(state: SlotState): Promise<boolean> {
 	try {
-		const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
-		const body: Record<string, string> = { filename: state.binFilename };
-		if (state.modelName) body.model = state.modelName;
+		const { modelParam, body } = buildSlotRequest(state, { filename: state.binFilename });
 
 		const response = await fetch(
 			`${state.serverUrl}/slots/${state.slotId}?action=restore${modelParam}`,
@@ -266,9 +283,7 @@ async function restoreSlot(state: SlotState): Promise<boolean> {
  */
 async function eraseSlot(state: SlotState): Promise<void> {
 	try {
-		const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
-		const body: Record<string, string> = {};
-		if (state.modelName) body.model = state.modelName;
+		const { modelParam, body } = buildSlotRequest(state);
 
 		const response = await fetch(
 			`${state.serverUrl}/slots/${state.slotId}?action=erase${modelParam}`,
@@ -526,7 +541,8 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 
 	pi.on("model_select", async (event, ctx) => {
 		if (!slotState) return;
-		log(`[llamacpp-slots] model_select: ${event.previousModel.id} -> ${event.model.id}`);
+		const prevId = event.previousModel?.id ?? "<unknown>";
+		log(`[llamacpp-slots] model_select: ${prevId} -> ${event.model.id}`);
 
 		// Save current slot state before switching
 		log(`[llamacpp-slots] Saving slot ${slotState.slotId} before model switch`);
@@ -540,6 +556,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		const newSlotId = await discoverSlots(slotState.serverUrl, newModelName);
 		if (newSlotId == null) {
 			log("[llamacpp-slots] Model switch: slot discovery failed — keeping old slot");
+			ctx.ui.notify("llamacpp-slots: slot discovery failed on model switch", "warning");
 			return;
 		}
 
@@ -550,12 +567,15 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
+		const oldModelName = slotState.modelName;
 		slotState.slotId = newSlotId;
 		slotState.modelName = newModelName;
 		slotState.binFilename = deriveBinFilename(sessionId, newModelName);
 		firstTurn = true;
 		// Always try restore on model switch — fails gracefully if .bin doesn't exist
 		isNewSession = false;
+		// Only trigger model load if model actually changed (avoid reload on same-model switch)
+		modelSwitchPending = oldModelName !== newModelName;
 
 		persistSlotState(pi);
 		log(`[llamacpp-slots] Model switch complete: slot=${newSlotId}, bin=${slotState.binFilename}`);
@@ -563,7 +583,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 
 	// ── Session Shutdown: Final Save + Conditional Erase ──────
 
-	pi.on("session_shutdown", async (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, _ctx) => {
 		if (!slotState) return;
 
 		const settings = loadSettings();
@@ -572,9 +592,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		// Per-turn saves via turn_end/agent_end are usually sufficient.
 		if (settings.saveOnShutdown && _event.reason !== "reload") {
 			try {
-				const modelParam = slotState.modelName ? `&model=${encodeURIComponent(slotState.modelName)}` : "";
-				const body: Record<string, string> = { filename: slotState.binFilename };
-				if (slotState.modelName) body.model = slotState.modelName;
+				const { modelParam, body } = buildSlotRequest(slotState, { filename: slotState.binFilename });
 
 				const response = await fetch(
 					`${slotState.serverUrl}/slots/${slotState.slotId}?action=save${modelParam}`,
@@ -606,12 +624,13 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 
 	// ── Turn Start: Restore Slot if Cold (ensures KV cache is loaded before requests) ──
 
-	pi.on("turn_start", async (_event, ctx) => {
+	pi.on("turn_start", async (_event, _ctx) => {
 		if (!slotsActive || !slotState) return;
 		const state = slotState;  // Capture for TS narrowing across awaits
 
 		const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName);
-		const nTokens = slotInfo?.n_prompt_tokens;
+		// Server can return "idle" string for n_prompt_tokens when no task is assigned
+		const nTokensRaw = slotInfo?.n_prompt_tokens as number | string | undefined;
 
 		if (slotInfo?.is_processing) {
 			// Slot is actively processing — skip restore to avoid interference.
@@ -636,9 +655,9 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 				return ok;
 			});
 			await restoringPromise;
-		} else if (nTokens === 0 || nTokens === undefined || nTokens === "idle") {
+		} else if (nTokensRaw === 0 || nTokensRaw === undefined || nTokensRaw === "idle") {
 			// Subsequent turn, slot is cold (0, missing, or idle) — llama.cpp restarted mid-session.
-			log(`[llamacpp-slots] Slot ${state.slotId} cold (n_prompt_tokens=${nTokens}) — restoring`);
+			log(`[llamacpp-slots] Slot ${state.slotId} cold (n_prompt_tokens=${nTokensRaw}) — restoring`);
 			restoringPromise = restoreSlot(state).then((ok) => {
 				if (ok) {
 					log(`[llamacpp-slots] Restored slot ${state.slotId} from ${state.binFilename}`);
@@ -652,8 +671,8 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			});
 			await restoringPromise;
 		} else {
-			// nTokens > 0 (warm) OR missing/idle (task_prev=null) — skip restore.
-			log(`[llamacpp-slots] Slot ${state.slotId} warm (n_prompt_tokens=${nTokens ?? "idle"}) — skipping restore`);
+			// nTokens > 0 (warm) — skip restore.
+			log(`[llamacpp-slots] Slot ${state.slotId} warm (n_prompt_tokens=${nTokensRaw ?? "idle"}) — skipping restore`);
 		}
 
 		restoringPromise = null;
