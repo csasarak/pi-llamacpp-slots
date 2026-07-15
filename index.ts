@@ -162,7 +162,7 @@ async function discoverSlots(serverUrl: string, modelName?: string): Promise<num
  * Get full slot info from GET /slots.
  * Returns the slot object (with state, n_prompt_tokens, etc.) or null if unavailable.
  */
-async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string): Promise<{ is_processing?: boolean; n_prompt_tokens?: number | string } | null> {
+async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string): Promise<{ is_processing?: boolean; n_prompt_tokens?: number | string; model?: string } | null> {
 	try {
 		const modelParam = modelName ? `?model=${encodeURIComponent(modelName)}` : "";
 		const response = await fetch(`${serverUrl}/slots${modelParam}`, {
@@ -590,6 +590,8 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 
 		// Optional final save before shutdown (disabled by default).
 		// Per-turn saves via turn_end/agent_end are usually sufficient.
+		// NOTE: Enabling this with router mode *could* trigger a model reload on quit
+		// if you quit another session which is using a different model that is not loaded.
 		if (settings.saveOnShutdown && _event.reason !== "reload") {
 			try {
 				const { modelParam, body } = buildSlotRequest(slotState, { filename: slotState.binFilename });
@@ -658,6 +660,8 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		} else if (nTokensRaw === 0 || nTokensRaw === undefined || nTokensRaw === "idle") {
 			// Subsequent turn, slot is cold (0, missing, or idle) — llama.cpp restarted mid-session.
 			log(`[llamacpp-slots] Slot ${state.slotId} cold (n_prompt_tokens=${nTokensRaw}) — restoring`);
+			// Server restarted, model may need reloading
+			modelSwitchPending = true;
 			restoringPromise = restoreSlot(state).then((ok) => {
 				if (ok) {
 					log(`[llamacpp-slots] Restored slot ${state.slotId} from ${state.binFilename}`);
