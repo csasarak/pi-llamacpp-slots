@@ -66,6 +66,7 @@ let restoringPromise: Promise<boolean> | null = null;  // In-flight restore prom
 let firstTurn = true;  // Track if this is the first turn of the session
 let isNewSession = false;  // True when no persisted slot state was found (brand-new session)
 let modelSwitchPending = false;  // True after model_select — send model param on first slot call to trigger load
+let isRouterMode = false;  // True when server requires model param (router mode)
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -179,21 +180,6 @@ async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string
 	} catch {
 		return null;
 	}
-}
-
-/**
- * Check if a slot's KV cache is cold (empty or nearly empty).
- * A slot is cold when n_prompt_tokens <= 1, meaning llama.cpp
- * restarted and lost its in-memory cache. Returns true if cold,
- * false if warm, null if the check fails.
- */
-async function isSlotCold(serverUrl: string, slotId: number, modelName?: string): Promise<boolean | null> {
-	const info = await getSlotInfo(serverUrl, slotId, modelName);
-	if (info) {
-		const tokens = typeof info.n_prompt_tokens === "number" ? info.n_prompt_tokens : 0;
-		return tokens <= 1;
-	}
-	return null;
 }
 
 /**
@@ -351,6 +337,40 @@ function deriveBinFilename(sessionId: string, modelName?: string): string {
 // ── Slash Command: /llama-slots ─────────────────────────────
 
 /** Toggle items for the settings selector */
+/**
+ * Allocate a slot by discovering available slots with model param.
+ * Sets modelSwitchPending so the first slot call triggers model load.
+ */
+async function tryActivateRouterSlot(ctx: any, pi: ExtensionAPI): Promise<void> {
+	if (slotsActive) return;
+
+	const settings = loadSettings();
+	const serverUrl = settings.serverUrl?.replace(/\/+$/, "") ?? ctx.model?.baseUrl?.replace(/\/+$/, "");
+	const modelName = settings.modelName ?? ctx.model?.id;
+	if (!serverUrl || !modelName) return;
+
+	const slotId = await discoverSlots(serverUrl, modelName);
+	if (slotId == null) return;
+
+	const sessionId = ctx.sessionManager.getSessionId();
+	const sessionFile = ctx.sessionManager.getSessionFile();
+	if (!sessionId || !sessionFile) return;
+
+	slotState = {
+		slotId,
+		sessionFile,
+		binFilename: deriveBinFilename(sessionId, modelName),
+		serverUrl,
+		modelName,
+	};
+	slotsActive = true;
+	firstTurn = true;
+	isNewSession = true;
+	modelSwitchPending = true;
+	persistSlotState(pi);
+	log(`[llamacpp-slots] Router mode: allocated slot ${slotId}`);
+}
+
 const TOGGLE_OPTIONS = [
 	{ key: "eraseOnQuit" as const, label: "eraseOnQuit", description: "Erase in-memory KV cache on quit" },
 	{ key: "saveOnAgentEnd" as const, label: "saveOnAgentEnd", description: "Save once per agent loop instead of per tool call" },
@@ -441,6 +461,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		log(`[llamacpp-slots] session_start fired, reason=${_event.reason}`);
+		isRouterMode = false;  // Reset each session
 		// Determine server URL: settings override wins, then fall back to ctx.model.baseUrl
 		const settings = loadSettings();
 		log(`[llamacpp-slots] settings.serverUrl=${settings.serverUrl}, ctx.model.baseUrl=${ctx.model?.baseUrl}`);
@@ -487,25 +508,21 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 				slotState.modelName = modelName;
 			}
 
-			// Quick probe to verify the server is reachable
-			const reachable = await isSlotCold(serverUrl, restored.slotId, restored.modelName);
-			if (reachable !== null) {
-				// ctx.ui.setStatus("llamacpp-slots", `slot ${slotState.slotId} ready`);
-			} else {
-				// ctx.ui.setStatus("llamacpp-slots", `slot ${slotState.slotId} (server unreachable)`);
-			}
+			// Skip probe — sends model param which triggers reload. turn_start checks cold anyway.
 			return;
 		}
 
 		log("[llamacpp-slots] No persisted slot state in branch — discovering fresh");
 
-		// Step 2: No persisted state — discover slots fresh
-		const slotId = await discoverSlots(serverUrl, modelName);
+		// Step 2: Try discovery without model param first (avoids reload trigger)
+		const slotId = await discoverSlots(serverUrl, undefined);
 		if (slotId == null) {
-			// Server doesn't support slots or is unreachable — stay dormant
+			// GET /slots failed — assume router mode (requires model param) and defer.
+			// Don't retry with model — that triggers reload. If server is actually down,
+			// before_provider_request will fail gracefully later.
+			isRouterMode = true;
 			slotsActive = false;
-			// ctx.ui.notify("llamacpp-slots: GET /slots failed — staying dormant", "warning");
-			// ctx.ui.setStatus("llamacpp-slots", "discovery failed");
+			log(`[llamacpp-slots] GET /slots failed — assuming router mode, deferring slot allocation`);
 			return;
 		}
 
@@ -704,7 +721,9 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 
 	// ── Before Provider Request: Inject id_slot + Wait for Restore ──
 
-	pi.on("before_provider_request", async (event, _ctx) => {
+	pi.on("before_provider_request", async (event, ctx) => {
+		// Avoid reload on session_start in router mode; discover when first needed
+		if (isRouterMode) await tryActivateRouterSlot(ctx, pi);
 		if (!slotsActive || !slotState) return undefined;
 		// Safety net: if turn_start triggered a restore that hasn't finished yet,
 		// wait for it before sending the request. Prevents the race where
