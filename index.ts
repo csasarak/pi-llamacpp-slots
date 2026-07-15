@@ -65,8 +65,9 @@ let saveController: AbortController | null = null;
 let restoringPromise: Promise<boolean> | null = null;  // In-flight restore promise for race prevention
 let firstTurn = true;  // Track if this is the first turn of the session
 let isNewSession = false;  // True when no persisted slot state was found (brand-new session)
-let modelSwitchPending = false;  // True after model_select — send model param on first slot call to trigger load
+let modelReloadPending = false;  // True after model switch or server restart — next slot call triggers model reload
 let isRouterMode = false;  // True when server requires model param (router mode)
+  // Heuristic: GET /slots without model fails → assume router. Could be server down, but fallback is graceful.
 
 // ── Constants ────────────────────────────────────────────────
 
@@ -184,19 +185,18 @@ async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string
 
 /**
  * Build query param and body for a slot API call.
- * Only includes `model` param when modelSwitchPending is true (first call after model switch).
- * This avoids triggering unnecessary model reloads on subsequent calls.
+ * Always includes `model` param when state.modelName is set so router routes to correct model.
+ * Clears modelReloadPending after first use (model load triggered).
  */
 function buildSlotRequest(state: SlotState, extraBody?: Record<string, string>): { modelParam: string; body: Record<string, string> } {
-	// Always include model param in router mode so server routes to correct model
 	const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
 	const body: Record<string, string> = { ...extraBody };
 	if (state.modelName) {
 		body.model = state.modelName;
 	}
 	// Clear pending flag after first use (model load triggered)
-	if (modelSwitchPending) {
-		modelSwitchPending = false;
+	if (modelReloadPending) {
+		modelReloadPending = false;
 	}
 	return { modelParam, body };
 }
@@ -339,9 +339,9 @@ function deriveBinFilename(sessionId: string, modelName?: string): string {
 /** Toggle items for the settings selector */
 /**
  * Allocate a slot by discovering available slots with model param.
- * Sets modelSwitchPending so the first slot call triggers model load.
+ * Sets modelReloadPending so the first slot call triggers model load.
  */
-async function tryActivateRouterSlot(ctx: any, pi: ExtensionAPI): Promise<void> {
+async function tryActivateRouterSlot(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
 	if (slotsActive) return;
 
 	const settings = loadSettings();
@@ -366,7 +366,7 @@ async function tryActivateRouterSlot(ctx: any, pi: ExtensionAPI): Promise<void> 
 	slotsActive = true;
 	firstTurn = true;
 	isNewSession = true;
-	modelSwitchPending = true;
+	modelReloadPending = true;
 	persistSlotState(pi);
 	log(`[llamacpp-slots] Router mode: allocated slot ${slotId}`);
 }
@@ -504,7 +504,17 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			isNewSession = false;
 
 			// Refresh modelName from current model (in case it changed)
-			if (modelName !== undefined) {
+			// Skip if model_switch already handled the update
+			if (modelName !== undefined && !modelReloadPending) {
+				// Model changed since slot was allocated — discover new slot
+				if (modelName !== restored.modelName) {
+					const newSlotId = await discoverSlots(serverUrl, modelName);
+					if (newSlotId != null) {
+						slotState.slotId = newSlotId;
+						slotState.binFilename = deriveBinFilename(ctx.sessionManager.getSessionId() ?? restored.binFilename, modelName);
+						log(`[llamacpp-slots] Model changed (${restored.modelName} -> ${modelName}), new slot ${newSlotId}`);
+					}
+				}
 				slotState.modelName = modelName;
 			}
 
@@ -592,7 +602,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		// Always try restore on model switch — fails gracefully if .bin doesn't exist
 		isNewSession = false;
 		// Only trigger model load if model actually changed (avoid reload on same-model switch)
-		modelSwitchPending = oldModelName !== newModelName;
+		modelReloadPending = oldModelName !== newModelName;
 
 		persistSlotState(pi);
 		log(`[llamacpp-slots] Model switch complete: slot=${newSlotId}, bin=${slotState.binFilename}`);
@@ -678,7 +688,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			// Subsequent turn, slot is cold (0, missing, or idle) — llama.cpp restarted mid-session.
 			log(`[llamacpp-slots] Slot ${state.slotId} cold (n_prompt_tokens=${nTokensRaw}) — restoring`);
 			// Server restarted, model may need reloading
-			modelSwitchPending = true;
+			modelReloadPending = true;
 			restoringPromise = restoreSlot(state).then((ok) => {
 				if (ok) {
 					log(`[llamacpp-slots] Restored slot ${state.slotId} from ${state.binFilename}`);
