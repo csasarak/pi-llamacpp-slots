@@ -671,6 +671,29 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		if (!slotsActive || !slotState) return;
 		const state = slotState;  // Capture for TS narrowing across awaits
 
+		// If model reload is pending, wait for slot to be ready before proceeding
+		// (prevents sending messages while router is still loading the new model)
+		if (modelReloadPending) {
+			log(`[llamacpp-slots] Waiting for model load to complete (slot ${state.slotId})`);
+			let attempts = 0;
+			const maxAttempts = 30;  // 30s max wait
+			while (attempts < maxAttempts) {
+				await new Promise((r) => setTimeout(r, 1000));
+				const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName);
+				if (slotInfo && !slotInfo.is_processing && (slotInfo.n_prompt_tokens !== undefined)) {
+					log(`[llamacpp-slots] Model load complete (slot ${state.slotId})`);
+					break;
+				}
+				attempts++;
+				if (attempts % 5 === 0) {
+					log(`[llamacpp-slots] Still waiting for model load... (${attempts}s)`);
+				}
+			}
+			if (attempts >= maxAttempts) {
+				log(`[llamacpp-slots] Timeout waiting for model load (slot ${state.slotId})`);
+			}
+		}
+
 		const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName);
 		// Server can return "idle" string for n_prompt_tokens when no task is assigned
 		const nTokensRaw = slotInfo?.n_prompt_tokens as number | string | undefined;
