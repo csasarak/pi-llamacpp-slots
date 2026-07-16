@@ -164,9 +164,9 @@ async function discoverSlots(serverUrl: string, modelName?: string): Promise<num
  * Get full slot info from GET /slots.
  * Returns the slot object (with state, n_prompt_tokens, etc.) or null if unavailable.
  */
-async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string): Promise<{ is_processing?: boolean; n_prompt_tokens?: number | string; model?: string } | null> {
+async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string, includeModel?: boolean): Promise<{ is_processing?: boolean; n_prompt_tokens?: number | string; model?: string } | null> {
 	try {
-		const modelParam = modelName ? `?model=${encodeURIComponent(modelName)}` : "";
+		const modelParam = (includeModel !== false && modelName) ? `?model=${encodeURIComponent(modelName)}` : "";
 		const response = await fetch(`${serverUrl}/slots${modelParam}`, {
 			signal: AbortSignal.timeout(3000),
 		});
@@ -679,7 +679,8 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			const maxAttempts = 30;  // 30s max wait
 			while (attempts < maxAttempts) {
 				await new Promise((r) => setTimeout(r, 1000));
-				const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName);
+				// Poll without model param to avoid triggering router model switch
+				const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName, false);
 				if (slotInfo && !slotInfo.is_processing && (slotInfo.n_prompt_tokens !== undefined)) {
 					log(`[llamacpp-slots] Model load complete (slot ${state.slotId})`);
 					break;
