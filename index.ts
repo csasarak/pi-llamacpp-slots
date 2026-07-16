@@ -194,10 +194,6 @@ function buildSlotRequest(state: SlotState, extraBody?: Record<string, string>):
 	if (state.modelName) {
 		body.model = state.modelName;
 	}
-	// Clear pending flag after first use (model load triggered)
-	if (modelReloadPending) {
-		modelReloadPending = false;
-	}
 	return { modelParam, body };
 }
 
@@ -693,6 +689,9 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			if (attempts >= maxAttempts) {
 				log(`[llamacpp-slots] Timeout waiting for model load (slot ${state.slotId})`);
 			}
+			// Model load triggered — flag cleared after wait loop (not in buildSlotRequest)
+			// so restoreSlot retries still see modelReloadPending=true
+			modelReloadPending = false;
 		}
 
 		const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName);
