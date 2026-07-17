@@ -367,6 +367,13 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 						slotState.slotId = newSlotId;
 						slotState.binFilename = deriveBinFilename(ctx.sessionManager.getSessionId() ?? restored.binFilename, modelName);
 						log(`[llamacpp-slots] Model changed (${restored.modelName} -> ${modelName}), new slot ${newSlotId}`);
+					} else {
+						// Discovery failed (router mode or server not ready) — defer to before_provider_request.
+						// Keep slotsActive=false so turn_start skips restore with stale slot ID.
+						slotsActive = false;
+						isRouterMode = true;
+						setModelReloadPending(true);
+						log(`[llamacpp-slots] Model changed (${restored.modelName} -> ${modelName}), discovery failed — deferring`);
 					}
 				}
 				slotState.modelName = modelName;
