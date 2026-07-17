@@ -543,10 +543,10 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			}
 			if (attempts >= maxAttempts) {
 				log(`[llamacpp-slots] Timeout waiting for model load (slot ${state.slotId})`);
+			} else {
+				// Only clear on successful load — timeout means model may still be loading
+				setModelReloadPending(false);
 			}
-			// Model load triggered — flag cleared after wait loop (not in buildSlotRequest)
-			// so restoreSlot retries still see modelReloadPending=true
-			setModelReloadPending(false);
 		}
 
 		// Omit model param on first turn of resumed session to avoid triggering
