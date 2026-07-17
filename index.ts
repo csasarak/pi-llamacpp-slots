@@ -359,8 +359,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			isNewSession = false;
 
 			// Refresh modelName from current model (in case it changed)
-			// Skip if model_switch already handled the update
-			if (modelName !== undefined && !getModelReloadPending()) {
+			if (modelName !== undefined) {
 				// Model changed since slot was allocated — discover new slot
 				if (modelName !== restored.modelName) {
 					const newSlotId = await discoverSlots(serverUrl, modelName);
@@ -543,7 +542,10 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			setModelReloadPending(false);
 		}
 
-		const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName);
+		// Omit model param on first turn of resumed session to avoid triggering
+		// model reload. Slot already allocated for this model — just check state.
+		const skipModel = firstTurn && !isNewSession;
+		const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName, !skipModel);
 		// Server can return "idle" string for n_prompt_tokens when no task is assigned
 		const nTokensRaw = slotInfo?.n_prompt_tokens as number | string | undefined;
 
