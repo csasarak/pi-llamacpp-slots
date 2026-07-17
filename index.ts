@@ -26,21 +26,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-
-// ── State Interface ──────────────────────────────────────────
-
-interface SlotState {
-	/** The llama.cpp slot ID assigned to this session */
-	slotId: number;
-	/** The session file path (stable Map key) */
-	sessionFile: string;
-	/** The .bin filename derived from session UUID */
-	binFilename: string;
-	/** The llama.cpp server base URL */
-	serverUrl: string;
-	/** Model identifier for router mode (e.g. "org/model.gguf:Q4_K_M"). Omitted in single-model mode. */
-	modelName?: string;
-}
+import { deriveBinFilename, buildSlotRequest, type SlotState, getModelReloadPending, setModelReloadPending, discoverSlots, getSlotInfo, restoreSlot, eraseSlot } from "./slot-logic";
 
 // ── Settings Interface ───────────────────────────────────────
 
@@ -65,7 +51,6 @@ let saveController: AbortController | null = null;
 let restoringPromise: Promise<boolean> | null = null;  // In-flight restore promise for race prevention
 let firstTurn = true;  // Track if this is the first turn of the session
 let isNewSession = false;  // True when no persisted slot state was found (brand-new session)
-let modelReloadPending = false;  // True after model switch or server restart — next slot call triggers model reload
 let isRouterMode = false;  // True when server requires model param (router mode)
   // Heuristic: GET /slots without model fails → assume router. Could be server down, but fallback is graceful.
 
@@ -136,66 +121,7 @@ function saveSettings(settings: SlotSettings): void {
  * Returns the first available slot ID, or the first slot ID if none available.
  * Returns null if the server doesn't support slot management.
  */
-async function discoverSlots(serverUrl: string, modelName?: string): Promise<number | null> {
-	try {
-		const modelParam = modelName ? `?model=${encodeURIComponent(modelName)}` : "";
-		const response = await fetch(`${serverUrl}/slots${modelParam}`, {
-			signal: AbortSignal.timeout(3000),
-		});
-		if (!response.ok) return null;
-
-		const data = await response.json();
-		if (Array.isArray(data)) {
-			for (const slot of data) {
-				if (slot.state === "available" || slot.state === "loading") {
-					return slot.id;
-				}
-			}
-			// If no available slot, return the first slot ID
-			return data[0]?.id ?? null;
-		}
-		return null;
-	} catch {
-		return null;
-	}
-}
-
-/**
- * Get full slot info from GET /slots.
- * Returns the slot object (with state, n_prompt_tokens, etc.) or null if unavailable.
- */
-async function getSlotInfo(serverUrl: string, slotId: number, modelName?: string, includeModel?: boolean): Promise<{ is_processing?: boolean; n_prompt_tokens?: number | string; model?: string } | null> {
-	try {
-		const modelParam = (includeModel !== false && modelName) ? `?model=${encodeURIComponent(modelName)}` : "";
-		const response = await fetch(`${serverUrl}/slots${modelParam}`, {
-			signal: AbortSignal.timeout(3000),
-		});
-		if (!response.ok) return null;
-
-		const data = await response.json();
-		if (Array.isArray(data)) {
-			const slot = data.find((s: any) => s.id === slotId);
-			return slot ?? null;
-		}
-		return null;
-	} catch {
-		return null;
-	}
-}
-
-/**
- * Build query param and body for a slot API call.
- * Always includes `model` param when state.modelName is set so router routes to correct model.
- * Clears modelReloadPending after first use (model load triggered).
- */
-function buildSlotRequest(state: SlotState, extraBody?: Record<string, string>): { modelParam: string; body: Record<string, string> } {
-	const modelParam = state.modelName ? `&model=${encodeURIComponent(state.modelName)}` : "";
-	const body: Record<string, string> = { ...extraBody };
-	if (state.modelName) {
-		body.model = state.modelName;
-	}
-	return { modelParam, body };
-}
+// ── Save Slot ────────────────────────────────────────────────
 
 /**
  * Save the current slot's KV cache to a .bin file.
@@ -230,70 +156,6 @@ function saveSlot(state: SlotState): void {
 		});
 }
 
-/**
- * Restore a slot's KV cache from a .bin file.
- * Awaited — called during turn_start. Retries briefly if model is still loading.
- */
-async function restoreSlot(state: SlotState): Promise<boolean> {
-	const maxRetries = 3;
-	const retryDelay = 2000; // ms
-
-	for (let attempt = 0; attempt <= maxRetries; attempt++) {
-		try {
-			const { modelParam, body } = buildSlotRequest(state, { filename: state.binFilename });
-
-			const response = await fetch(
-				`${state.serverUrl}/slots/${state.slotId}?action=restore${modelParam}`,
-				{
-					method: "POST",
-					headers: { "Content-Type": "application/json" },
-					body: JSON.stringify(body),
-				},
-			);
-			if (response.ok) return true;
-
-			// Retry on 400/500 if modelReloadPending (model likely still loading)
-			if (modelReloadPending && [400, 500].includes(response.status) && attempt < maxRetries) {
-				log(`[llamacpp-slots] Restore failed: HTTP ${response.status}, retrying in ${retryDelay}ms`);
-				await new Promise((r) => setTimeout(r, retryDelay));
-				continue;
-			}
-
-			log(`[llamacpp-slots] Restore failed: HTTP ${response.status} (file may not exist)`);
-			return false;
-		} catch (err) {
-			log(`[llamacpp-slots] Restore error: ${(err as Error).message}`);
-			return false;
-		}
-	}
-	return false;
-}
-
-/**
- * Erase a slot's in-memory KV cache.
- * Awaited — called during session_shutdown on quit (when configured).
- */
-async function eraseSlot(state: SlotState): Promise<void> {
-	try {
-		const { modelParam, body } = buildSlotRequest(state);
-
-		const response = await fetch(
-			`${state.serverUrl}/slots/${state.slotId}?action=erase${modelParam}`,
-			{
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(body),
-			},
-		);
-		if (!response.ok) {
-			log(`[llamacpp-slots] Erase failed: HTTP ${response.status}`);
-		}
-	} catch (err) {
-		// Server may already be shutting down
-		log(`[llamacpp-slots] Erase error: ${(err as Error).message}`);
-	}
-}
-
 // ── Persistence ──────────────────────────────────────────────
 
 /**
@@ -323,19 +185,6 @@ function restoreFromBranch(ctx: ExtensionContext): SlotState | null {
 	}
 
 	return restored;
-}
-
-// ── Slot Filename Derivation ─────────────────────────────────
-
-/**
- * Derive a deterministic .bin filename from the session ID.
- * Uses getSessionId() for a clean UUID-based name.
- */
-function deriveBinFilename(sessionId: string, modelName?: string): string {
-	// Strip hyphens from UUID for a cleaner filename
-	const cleanId = sessionId.replace(/-/g, "");
-	const modelSuffix = modelName ? `_${modelName.replace(/[^a-zA-Z0-9]/g, "_")}` : "";
-	return `session_${cleanId}${modelSuffix}.bin`;
 }
 
 // ── Extension Factory ────────────────────────────────────────
@@ -372,7 +221,7 @@ async function tryActivateRouterSlot(ctx: ExtensionContext, pi: ExtensionAPI): P
 	slotsActive = true;
 	firstTurn = true;
 	isNewSession = true;
-	modelReloadPending = true;
+	setModelReloadPending(true);
 	persistSlotState(pi);
 	log(`[llamacpp-slots] Router mode: allocated slot ${slotId}`);
 }
@@ -511,7 +360,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 
 			// Refresh modelName from current model (in case it changed)
 			// Skip if model_switch already handled the update
-			if (modelName !== undefined && !modelReloadPending) {
+			if (modelName !== undefined && !getModelReloadPending()) {
 				// Model changed since slot was allocated — discover new slot
 				if (modelName !== restored.modelName) {
 					const newSlotId = await discoverSlots(serverUrl, modelName);
@@ -593,7 +442,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		if (newSlotId == null) {
 			log("[llamacpp-slots] Model switch: slot discovery failed — keeping old slot ID");
 			ctx.ui.notify("llamacpp-slots: slot discovery failed on model switch", "warning");
-			modelReloadPending = true;
+			setModelReloadPending(true);
 			return;
 		}
 
@@ -612,7 +461,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 		// Always try restore on model switch — fails gracefully if .bin doesn't exist
 		isNewSession = false;
 		// Only trigger model load if model actually changed (avoid reload on same-model switch)
-		modelReloadPending = oldModelName !== newModelName;
+		setModelReloadPending(oldModelName !== newModelName);
 
 		persistSlotState(pi);
 		log(`[llamacpp-slots] Model switch complete: slot=${newSlotId}, bin=${slotState.binFilename}`);
@@ -669,7 +518,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 
 		// If model reload is pending, wait for slot to be ready before proceeding
 		// (prevents sending messages while router is still loading the new model)
-		if (modelReloadPending) {
+		if (getModelReloadPending()) {
 			log(`[llamacpp-slots] Waiting for model load to complete (slot ${state.slotId})`);
 			let attempts = 0;
 			const maxAttempts = 30;  // 30s max wait
@@ -691,7 +540,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			}
 			// Model load triggered — flag cleared after wait loop (not in buildSlotRequest)
 			// so restoreSlot retries still see modelReloadPending=true
-			modelReloadPending = false;
+			setModelReloadPending(false);
 		}
 
 		const slotInfo = await getSlotInfo(state.serverUrl, state.slotId, state.modelName);
@@ -725,7 +574,7 @@ export default function llamacppSlotsExtension(pi: ExtensionAPI): void {
 			// Subsequent turn, slot is cold (0, missing, or idle) — llama.cpp restarted mid-session.
 			log(`[llamacpp-slots] Slot ${state.slotId} cold (n_prompt_tokens=${nTokensRaw}) — restoring`);
 			// Server restarted, model may need reloading
-			modelReloadPending = true;
+			setModelReloadPending(true);
 			restoringPromise = restoreSlot(state).then((ok) => {
 				if (ok) {
 					log(`[llamacpp-slots] Restored slot ${state.slotId} from ${state.binFilename}`);
